@@ -123,19 +123,49 @@ def quadratic_crop(x, bbox, alpha=1.0):
 
 
 def custom_collate(batch):
-    r"""source: pytorch 1.9.0, only one modification to original code """
+    """
+    Custom collate function with improved tensor handling
+    """
+    # Handle empty batch
+    if len(batch) == 0:
+        return batch
 
     elem = batch[0]
     elem_type = type(elem)
+
+    # Handle tensor inputs
     if isinstance(elem, torch.Tensor):
-        out = None
-        if torch.utils.data.get_worker_info() is not None:
-            # If we're in a background process, concatenate directly into a
-            # shared memory tensor to avoid an extra copy
-            numel = sum([x.numel() for x in batch])
-            storage = elem.storage()._new_shared(numel)
-            out = elem.new(storage)
-        return torch.stack(batch, 0, out=out)
+        # Check if all tensors have the same shape
+        shapes = [x.shape for x in batch]
+        
+        # If shapes are different, resize to the maximum shape
+        if len(set(shapes)) > 1:
+            # Find the maximum shape
+            max_shape = max(shapes, key=lambda x: x[0] * x[1] * x[2])
+            
+            # Resize tensors to match the maximum shape
+            resized_batch = []
+            for x in batch:
+                if x.shape != max_shape:
+                    # Interpolate to match the maximum shape
+                    # Assumes image-like tensors (C, H, W)
+                    x_resized = F.interpolate(
+                        x.unsqueeze(0),  # Add batch dimension
+                        size=max_shape[1:],  # Resize to max H, W
+                        mode='bilinear',  # or 'nearest' depending on your data
+                        align_corners=False
+                    ).squeeze(0)  # Remove batch dimension
+                    resized_batch.append(x_resized)
+                else:
+                    resized_batch.append(x)
+            
+            # Stack the resized tensors
+            return torch.stack(resized_batch, 0)
+        
+        # If all shapes are the same, use standard stacking
+        return torch.stack(batch, 0)
+
+    # Rest of the original collate function remains the same
     elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
             and elem_type.__name__ != 'string_':
         if elem_type.__name__ == 'ndarray' or elem_type.__name__ == 'memmap':
@@ -156,8 +186,8 @@ def custom_collate(batch):
         return {key: custom_collate([d[key] for d in batch]) for key in elem}
     elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
         return elem_type(*(custom_collate(samples) for samples in zip(*batch)))
-    if isinstance(elem, collections.abc.Sequence) and isinstance(elem[0], Annotation):  # added
-        return batch  # added
+    if isinstance(elem, collections.abc.Sequence) and isinstance(elem[0], Annotation):
+        return batch
     elif isinstance(elem, collections.abc.Sequence):
         # check to make sure that the elements in batch have consistent size
         it = iter(batch)
