@@ -102,19 +102,24 @@ class VQModel(pl.LightningModule):
             return discloss
 
     def validation_step(self, batch, batch_idx):
-        x = self.get_input(batch, self.image_key)
-        xrec, qloss = self(x)
-        aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val")
+          x = self.get_input(batch, self.image_key)
+          xrec, qloss = self(x)
+          aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
+                                    last_layer=self.get_last_layer(), split="val")
 
-        discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val")
-        rec_loss = log_dict_ae["val/rec_loss"]
-        self.log("val/aeloss", aeloss,
-             prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log_dict(log_dict_ae, prog_bar=True, logger=True, on_step=False, on_epoch=True)
-        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        return log_dict_ae
+          discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
+                                        last_layer=self.get_last_layer(), split="val")
+    
+            # More detailed logging
+          metrics = {
+                'val/rec_loss': log_dict_ae['val/rec_loss'],
+                'val/quant_loss': qloss.mean(),
+                'val/aeloss': aeloss,
+              }
+    
+          self.log_dict(metrics, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+    
+          return metrics
 
     def configure_optimizers(self):
         lr = self.learning_rate
@@ -400,3 +405,5 @@ class EMAVQ(VQModel):
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9))
         return [opt_ae, opt_disc], []                                           
+                 
+
