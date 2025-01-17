@@ -1,8 +1,8 @@
 model:
-  base_learning_rate: 4.5e-6
+  base_learning_rate: 1.0e-06
   target: taming.models.vqgan.VQModel
   params:
-    embed_dim: 256
+    embed_dim: 128
     n_embed: 1024
     ddconfig:
       double_z: False
@@ -21,9 +21,9 @@ model:
       params:
         disc_conditional: False
         disc_in_channels: 3
-        disc_start: 10000
-        disc_weight: 0.8
-        codebook_weight: 1.0
+        disc_start: 1000
+        disc_weight: 0.5
+        codebook_weight: 0.5
 
 data:
   target: main.DataModuleFromConfig
@@ -33,11 +33,18 @@ data:
     train:
       target: taming.data.custom.CustomTrain
       params:
-        training_images_list_file: some/training.txt
+        training_images_list_file: /content/vqgantest/data/ade20k_examples.txt
         size: 256
     validation:
       target: taming.data.custom.CustomTest
       params:
-        test_images_list_file: some/test.txt
+        test_images_list_file: /content/vqgantest/data/ade20k_examples.txt
         size: 256
+
+lightning:
+  trainer:
+    max_epochs: 1000  # or set to -1 for unlimited training
+    log_every_n_steps: 10
+    accelerator: gpu
+    devices: 1
 
