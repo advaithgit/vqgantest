@@ -132,48 +132,93 @@ class WrappedDataset(Dataset):
 
 
 class DataModuleFromConfig(pl.LightningDataModule):
-    def __init__(self, batch_size, train=None, validation=None, test=None,
-                 wrap=False, num_workers=None):
+    def __init__(self, 
+                 batch_size, 
+                 train=None, 
+                 validation=None, 
+                 test=None,
+                 wrap=False, 
+                 num_workers=None):
         super().__init__()
         self.batch_size = batch_size
         self.dataset_configs = dict()
-        self.num_workers = num_workers if num_workers is not None else batch_size*2
-        if train is not None:
-            self.dataset_configs["train"] = train
-            self.train_dataloader = self._train_dataloader
-        if validation is not None:
-            self.dataset_configs["validation"] = validation
-            self.val_dataloader = self._val_dataloader
-        if test is not None:
-            self.dataset_configs["test"] = test
-            self.test_dataloader = self._test_dataloader
+        
+        # Improved num_workers calculation
+        if num_workers is None:
+            try:
+                # Use min of batch_size*2 and available CPU cores
+                self.num_workers = min(batch_size*2, os.cpu_count() or 2)
+            except:
+                self.num_workers = 2
+        else:
+            self.num_workers = num_workers
+        
+        # Dataset configuration
+        self.dataset_configs = {
+            "train": train,
+            "validation": validation,
+            "test": test
+        }
         self.wrap = wrap
+        
+        # Datasets will be populated in setup
+        self.datasets = {}
 
     def prepare_data(self):
-        for data_cfg in self.dataset_configs.values():
-            instantiate_from_config(data_cfg)
+        """Prepare data - called only on 1 GPU in distributed settings"""
+        for name, data_cfg in self.dataset_configs.items():
+            if data_cfg is not None:
+                instantiate_from_config(data_cfg)
 
     def setup(self, stage=None):
-        self.datasets = dict(
-            (k, instantiate_from_config(self.dataset_configs[k]))
-            for k in self.dataset_configs)
-        if self.wrap:
-            for k in self.datasets:
-                self.datasets[k] = WrappedDataset(self.datasets[k])
+        """Set up datasets for each stage"""
+        self.datasets = {}
+        for name, data_cfg in self.dataset_configs.items():
+            if data_cfg is not None:
+                dataset = instantiate_from_config(data_cfg)
+                
+                # Optional wrapping
+                if self.wrap:
+                    dataset = WrappedDataset(dataset)
+                
+                self.datasets[name] = dataset
 
-    def _train_dataloader(self):
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=True, collate_fn=custom_collate)
+    def _create_dataloader(self, dataset, shuffle=False):
+        """Common dataloader creation method"""
+        return DataLoader(
+            dataset, 
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=shuffle,
+            collate_fn=custom_collate,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.num_workers > 0
+        )
 
-    def _val_dataloader(self):
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers, collate_fn=custom_collate)
+    def train_dataloader(self):
+        """Create train dataloader"""
+        if "train" not in self.datasets:
+            raise ValueError("Train dataset not configured")
+        return self._create_dataloader(self.datasets["train"], shuffle=True)
 
-    def _test_dataloader(self):
-        return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, collate_fn=custom_collate)
+    def val_dataloader(self):
+        """Create validation dataloader"""
+        if "validation" not in self.datasets:
+            raise ValueError("Validation dataset not configured")
+        return self._create_dataloader(self.datasets["validation"], shuffle=False)
 
+    def test_dataloader(self):
+        """Create test dataloader"""
+        if "test" not in self.datasets:
+            raise ValueError("Test dataset not configured")
+        return self._create_dataloader(self.datasets["test"], shuffle=False)
+
+    def predict_dataloader(self):
+        """Optional predict dataloader"""
+        # You can implement this if needed
+        if "test" in self.datasets:
+            return self._create_dataloader(self.datasets["test"], shuffle=False)
+        return None
 
 class SetupCallback(Callback):
     def __init__(self, resume, now, logdir, ckptdir, cfgdir, config, lightning_config):
@@ -217,83 +262,141 @@ class SetupCallback(Callback):
                     pass
 
 class ImageLogger(Callback):
-    def __init__(self, batch_frequency, max_images, clamp=True, increase_log_steps=True):
+    def __init__(self, 
+                 batch_frequency=2000, 
+                 max_images=4, 
+                 clamp=True, 
+                 increase_log_steps=True,
+                 log_all_val=False,
+                 disabled=False):
         super().__init__()
         self.batch_freq = batch_frequency
         self.max_images = max_images
+        self.log_all_val = log_all_val
+        self.disabled = disabled
+        
+        # Logger mapping for different logger types
         self.logger_log_images = {
             pl.loggers.TensorBoardLogger: self._tensorboard_logging,
         }
+        
+        # Calculate log steps
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
+        
         self.clamp = clamp
 
     @rank_zero_only
     def _tensorboard_logging(self, pl_module, images, batch_idx, split):
         """Log images to TensorBoard"""
-        for k in images:
-            grid = torchvision.utils.make_grid(images[k])
-            grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
-            
-            tag = f"{split}/{k}"
-            pl_module.logger.experiment.add_image(
-                tag, grid,
-                global_step=pl_module.global_step
-            )
+        try:
+            for k, img_tensor in images.items():
+                # Ensure image is in correct range
+                grid = torchvision.utils.make_grid(img_tensor)
+                grid = (grid + 1.0) / 2.0  # Normalize to 0-1 range
+                
+                tag = f"{split}/{k}"
+                pl_module.logger.experiment.add_image(
+                    tag, grid,
+                    global_step=pl_module.global_step
+                )
+        except Exception as e:
+            print(f"Error in TensorBoard logging: {e}")
 
     @rank_zero_only
-    def log_local(self, save_dir, split, images,
-                  global_step, current_epoch, batch_idx):
-        root = os.path.join(save_dir, "images", split)
-        for k in images:
-            grid = torchvision.utils.make_grid(images[k], nrow=4)
+    def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
+        """Save images locally"""
+        try:
+            root = os.path.join(save_dir, "images", split)
+            os.makedirs(root, exist_ok=True)
 
-            grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
-            grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
-            grid = grid.numpy()
-            grid = (grid * 255).astype(np.uint8)
-            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
-                k,
-                global_step,
-                current_epoch,
-                batch_idx)
-            path = os.path.join(root, filename)
-            os.makedirs(os.path.split(path)[0], exist_ok=True)
-            Image.fromarray(grid).save(path)
+            for k, img_tensor in images.items():
+                # Create grid
+                grid = torchvision.utils.make_grid(img_tensor, nrow=4)
+                
+                # Normalize and convert to numpy
+                grid = (grid + 1.0) / 2.0  # Normalize to 0-1
+                grid = grid.permute(1, 2, 0).cpu().numpy()
+                grid = (grid * 255).astype(np.uint8)
+
+                # Create filename
+                filename = f"{k}_gs-{global_step:06d}_e-{current_epoch:06d}_b-{batch_idx:06d}.png"
+                path = os.path.join(root, filename)
+
+                # Save image
+                Image.fromarray(grid).save(path)
+        except Exception as e:
+            print(f"Error saving local images: {e}")
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
-        if (self.check_frequency(batch_idx) and  # batch_idx % self.batch_freq == 0
-                hasattr(pl_module, "log_images") and
-                callable(pl_module.log_images) and
-                self.max_images > 0):
-            logger = type(pl_module.logger)
+        """Main image logging method"""
+        try:
+            # Check if logging is needed
+            if not self.check_frequency(batch_idx):
+                return
 
-            is_train = pl_module.training
-            if is_train:
-                pl_module.eval()
+            # Ensure log_images method exists
+            if not hasattr(pl_module, "log_images") or not callable(pl_module.log_images):
+                print("log_images method not found in the module")
+                return
 
+            # Temporarily switch to eval mode
+            was_training = pl_module.training
+            pl_module.eval()
+
+            # Disable gradient computation
             with torch.no_grad():
+                # Get images to log
                 images = pl_module.log_images(batch, split=split, pl_module=pl_module)
 
-            for k in images:
-                N = min(images[k].shape[0], self.max_images)
-                images[k] = images[k][:N]
-                if isinstance(images[k], torch.Tensor):
-                    images[k] = images[k].detach().cpu()
+            # Process images
+            processed_images = {}
+            for k, img_tensor in images.items():
+                # Limit number of images
+                N = min(img_tensor.shape[0], self.max_images)
+                img_tensor = img_tensor[:N]
+
+                # Ensure tensor and clamp if needed
+                if isinstance(img_tensor, torch.Tensor):
+                    img_tensor = img_tensor.detach().cpu()
                     if self.clamp:
-                        images[k] = torch.clamp(images[k], -1., 1.)
+                        img_tensor = torch.clamp(img_tensor, -1., 1.)
+                
+                processed_images[k] = img_tensor
 
-            self.log_local(pl_module.logger.save_dir, split, images,
-                          pl_module.global_step, pl_module.current_epoch, batch_idx)
+            # Log images
+            if processed_images:
+                # Local file logging
+                self.log_local(
+                    pl_module.logger.save_dir, 
+                    split, 
+                    processed_images,
+                    pl_module.global_step, 
+                    pl_module.current_epoch, 
+                    batch_idx
+                )
 
-            logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
-            logger_log_images(pl_module, images, batch_idx, split)
+                # Logger-specific logging
+                logger_type = type(pl_module.logger)
+                logger_log_images = self.logger_log_images.get(logger_type, lambda *args, **kwargs: None)
+                logger_log_images(pl_module, processed_images, batch_idx, split)
 
-            if is_train:
+            # Restore original training state
+            if was_training:
+                pl_module.train()
+
+        except Exception as e:
+            print(f"Error in image logging: {e}")
+            # Restore training state in case of error
+            if was_training:
                 pl_module.train()
 
     def check_frequency(self, batch_idx):
+        """Determine if logging should occur"""
+        if self.disabled:
+            return False
+        
         if (batch_idx % self.batch_freq) == 0 or (batch_idx in self.log_steps):
             try:
                 self.log_steps.pop(0)
@@ -302,11 +405,20 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
-        self.log_img(pl_module, batch, batch_idx, split="train")
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=None):
+        """Callback for end of training batch"""
+        try:
+            self.log_img(pl_module, batch, batch_idx, split="train")
+        except Exception as e:
+            print(f"Error in on_train_batch_end: {e}")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
-        self.log_img(pl_module, batch, batch_idx, split="val")
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=None):
+        """Callback for end of validation batch"""
+        try:
+            if self.log_all_val:
+                self.log_img(pl_module, batch, batch_idx, split="val")
+        except Exception as e:
+            print(f"Error in on_validation_batch_end: {e}")
 
 
 
@@ -492,9 +604,10 @@ if __name__ == "__main__":
             "image_logger": {
                 "target": "main.ImageLogger",
                 "params": {
-                    "batch_frequency": 750,
+                    "batch_frequency": 500,
                     "max_images": 4,
-                    "clamp": True
+                    "clamp": True,
+                    
                 }
             },
             "learning_rate_logger": {
@@ -521,7 +634,25 @@ if __name__ == "__main__":
             callback = instantiate_from_config(callbacks_cfg[k])
             trainer_kwargs["callbacks"].append(callback)
 
+
+        trainer_kwargs['max_epochs'] = 1000
+        trainer_kwargs['log_every_n_steps'] = 5
+        trainer_kwargs['gradient_clip_val'] = 0.5
+
+        # Add precision and accelerator settings
+        if not cpu:  # Only if not running on CPU
+              trainer_kwargs['precision'] = 16  # Mixed precision
+              trainer_kwargs['accelerator'] = 'gpu'
+              trainer_kwargs['devices'] = gpuinfo if isinstance(gpuinfo, int) else len(gpuinfo)
+
+        # Optionally add learning rate scheduling callback
+        lr_monitor = LearningRateMonitor(logging_interval='step')
+        if lr_monitor not in trainer_kwargs.get('callbacks', []):
+              trainer_kwargs['callbacks'].append(lr_monitor)
+
+        # Create trainer
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+        
 
         # data
         data = instantiate_from_config(config.data)
