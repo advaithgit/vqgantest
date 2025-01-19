@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
-
+from model.MSEncoder.MSEncoder import MultiStageEncoder
 
 def get_timestep_embedding(timesteps, embedding_dim):
     """
@@ -197,7 +197,8 @@ class Model(nn.Module):
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, use_timestep=True):
         super().__init__()
-        self.ch = ch
+        #self.ch = ch
+        self.ch = ((ch - 1) // 4 + 1) * 4 
         self.temb_ch = self.ch*4
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
@@ -217,7 +218,7 @@ class Model(nn.Module):
 
         # downsampling
         self.conv_in = torch.nn.Conv2d(in_channels,
-                                       self.ch,
+                                       in_channels,
                                        kernel_size=3,
                                        stride=1,
                                        padding=1)
@@ -351,12 +352,12 @@ class Encoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
 
-        # downsampling
-        self.conv_in = torch.nn.Conv2d(in_channels,
-                                       self.ch,
-                                       kernel_size=3,
-                                       stride=1,
-                                       padding=1)
+        # Replace initial Conv2d with MultiStageEncoder
+        self.conv_in = MultiStageEncoder(
+            in_channels=in_channels,
+            out_channels=self.ch,
+            stride=1
+        )
 
         curr_res = resolution
         in_ch_mult = (1,)+tuple(ch_mult)
@@ -396,11 +397,11 @@ class Encoder(nn.Module):
 
         # end
         self.norm_out = Normalize(block_in)
-        self.conv_out = torch.nn.Conv2d(block_in,
-                                        2*z_channels if double_z else z_channels,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1)
+        self.conv_out = MultiStageEncoder(
+            in_channels=block_in,
+            out_channels=2*z_channels if double_z else z_channels,
+            stride=1
+        )
 
 
     def forward(self, x):
@@ -773,4 +774,3 @@ class UpsampleDecoder(nn.Module):
         h = nonlinearity(h)
         h = self.conv_out(h)
         return h
-
