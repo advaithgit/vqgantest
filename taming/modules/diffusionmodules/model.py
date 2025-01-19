@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
-from taming.model.MSEncoder.MSEncoder import MultiStageEncoder
+from taming.models.MSEncoder.MSEncoder import MultiStageEncoder
 
 def get_timestep_embedding(timesteps, embedding_dim):
     """
